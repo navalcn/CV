@@ -74,8 +74,91 @@ MAP_W, MAP_H = 240, 320
 MAP_MARGIN = 20
 
 
-def build_homography():
-    src = np.float32(SRC_POINTS)
+def detect_lane_lines_and_vanishing_point(frame):
+    """
+    Automated Vanishing Point Detection:
+    Uses Edge Detection + Probabilistic Hough Lines on the roadway region
+    to find left and right lane boundaries and compute their intersection (Vanishing Point).
+    """
+    h, w = frame.shape[:2]
+    # Region of interest focused on the highway surface
+    roi_y_min, roi_y_max = int(h * 0.35), int(h * 0.85)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    
+    # Mask outside road ROI
+    mask = np.zeros_like(edges)
+    mask[roi_y_min:roi_y_max, :] = 255
+    masked_edges = cv2.bitwise_and(edges, mask)
+    
+    lines = cv2.HoughLinesP(masked_edges, 1, np.pi / 180, threshold=40, minLineLength=60, maxLineGap=20)
+    
+    left_lines = []
+    right_lines = []
+    try:
+        if lines is not None:
+            for l in lines:
+                arr = np.array(l).flatten()
+                if len(arr) == 4:
+                    x1, y1, x2, y2 = int(arr[0]), int(arr[1]), int(arr[2]), int(arr[3])
+                    if x2 == x1: continue
+                    slope = (y2 - y1) / float(x2 - x1)
+                    # Filter steep lane boundary slopes
+                    if -4.0 < slope < -0.3:
+                        left_lines.append((x1, y1, x2, y2))
+                    elif 0.3 < slope < 4.0:
+                        right_lines.append((x1, y1, x2, y2))
+                    
+        # If lane lines detected with sufficient confidence, refine the 4 reference points
+        if len(left_lines) >= 1 and len(right_lines) >= 1:
+            # Fit average lines
+            def fit_line(lines_list):
+                pts = []
+                for x1, y1, x2, y2 in lines_list:
+                    pts.append([x1, y1])
+                    pts.append([x2, y2])
+                pts = np.array(pts)
+                vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+                return float(vx[0]), float(vy[0]), float(x0[0]), float(y0[0])
+
+            vx_l, vy_l, x0_l, y0_l = fit_line(left_lines)
+            vx_r, vy_r, x0_r, y0_r = fit_line(right_lines)
+            
+            # Calculate intersection (vanishing point)
+            if abs(vy_l * vx_r - vy_r * vx_l) > 1e-4:
+                m_l = vy_l / (vx_l + 1e-6)
+                m_r = vy_r / (vx_r + 1e-6)
+                c_l = y0_l - m_l * x0_l
+                c_r = y0_r - m_r * x0_r
+                if abs(m_l - m_r) > 1e-4:
+                    vp_x = (c_r - c_l) / (m_l - m_r)
+                    vp_y = m_l * vp_x + c_l
+                    
+                    # Derive 4 ground points along the detected perspective bounds
+                    y_far, y_near = 450.0, 750.0
+                    x_far_l = (y_far - c_l) / m_l
+                    x_far_r = (y_far - c_r) / m_r
+                    x_near_l = (y_near - c_l) / m_l
+                    x_near_r = (y_near - c_r) / m_r
+                    
+                    # Sanity check derived points
+                    if 0 < x_far_l < x_far_r < w and 0 < x_near_l < x_near_r < w:
+                        auto_points = [
+                            (int(x_far_l), int(y_far)),
+                            (int(x_far_r), int(y_far)),
+                            (int(x_near_r), int(y_near)),
+                            (int(x_near_l), int(y_near))
+                        ]
+                        return auto_points, (int(vp_x), int(vp_y))
+    except Exception as e:
+        print(f"[Auto-Calibration Notice] Fallback to calibrated road points ({e})")
+    return SRC_POINTS, None
+
+
+def build_homography(custom_points=None):
+    pts = custom_points if custom_points is not None else SRC_POINTS
+    src = np.float32(pts)
     dst = np.float32([
         [0, 0],
         [LANE_WIDTH_M, 0],
@@ -83,7 +166,7 @@ def build_homography():
         [0, LANE_LENGTH_M],
     ])
     M = cv2.getPerspectiveTransform(src, dst)
-    return M
+    return M, pts
 
 
 def to_world(M, px, py):
@@ -170,22 +253,36 @@ def draw_vehicle_badge(frame, x1, y1, x2, y2, track_id, cls_name, speed_kmh, spe
     cv2.putText(frame, badge_text, (badge_x1 + 6, badge_y2 - 5), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
 
-def main(video_path, speed_limit_kmh=60.0, conf=0.3, count_line_frac=0.55):
-    M = build_homography()
-    model = YOLO("yolov8n.pt")
-
+def main(video_path, speed_limit_kmh=60.0, conf=0.3, count_line_frac=0.55, auto_calibrate=True):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Automated Vanishing Point & Homography Estimation
+    active_points = SRC_POINTS
+    vp_point = None
+    if auto_calibrate:
+        ret, sample_frame = cap.read()
+        if ret:
+            active_points, vp_point = detect_lane_lines_and_vanishing_point(sample_frame)
+            if vp_point is not None:
+                print(f"[Auto-Calibration] Vanishing Point detected at: ({vp_point[0]}, {vp_point[1]})")
+                print(f"[Auto-Calibration] Dynamically adjusted road vertices: {active_points}")
+            else:
+                print("[Auto-Calibration] Defaulting to baseline road vertices.")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    M, calibrated_points = build_homography(active_points)
+    model = YOLO("yolov8n.pt")
     cap.release()
 
     count_line_y = int(frame_height * count_line_frac)
 
     print(f"Video: {video_path} | FPS: {fps:.1f} | Total Frames: {total_video_frames} | Frame: {frame_width}x{frame_height}")
-    print(f"Homography calibration: width={LANE_WIDTH_M}m, length={LANE_LENGTH_M}m")
     print(f"Counting line at y={count_line_y}px | Speed limit: {speed_limit_kmh} km/h")
+    print(f"Active Homography Zone: {calibrated_points}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter("annotated_output.mp4", fourcc, fps, (frame_width, frame_height))
@@ -215,10 +312,14 @@ def main(video_path, speed_limit_kmh=60.0, conf=0.3, count_line_frac=0.55):
         frame = r.orig_img.copy()
 
         # Draw calibration trapezoid + counting line
-        pts = np.array(SRC_POINTS, dtype=np.int32).reshape(-1, 1, 2)
+        pts = np.array(calibrated_points, dtype=np.int32).reshape(-1, 1, 2)
         cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-        cv2.putText(frame, "Calibration Zone", (SRC_POINTS[0][0], SRC_POINTS[0][1] - 8),
+        calib_label = "Auto Calib Zone" if vp_point is not None else "Calibration Zone"
+        cv2.putText(frame, calib_label, (calibrated_points[0][0], calibrated_points[0][1] - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        if vp_point is not None and frame_num < 60:
+            cv2.circle(frame, vp_point, 5, (0, 255, 255), -1)
+            cv2.putText(frame, "VP", (vp_point[0] + 6, vp_point[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
         
         cv2.line(frame, (0, count_line_y), (frame_width, count_line_y), (0, 165, 255), 2)
         cv2.putText(frame, "Count Line", (15, count_line_y - 8),
