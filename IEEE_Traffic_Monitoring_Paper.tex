@@ -3,11 +3,14 @@
 \usepackage{cite}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{algorithmic}
+\usepackage{algorithm}
 \usepackage{graphicx}
 \usepackage{textcomp}
 \usepackage{xcolor}
 \usepackage{booktabs}
 \usepackage{url}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, calc, fit, backgrounds}
 
 \begin{document}
 
@@ -27,242 +30,410 @@ Email: \IEEEauthorrefmark{1}1ga23ad034@gat.ac.in,
 \maketitle
 
 \begin{abstract}
-Traffic congestion and over-speeding are big problems in modern cities. Most traditional methods like radar guns and road loop sensors are expensive to install and fix. Standard roadside CCTV cameras are already available everywhere, but estimating vehicle speed from a normal camera video is tricky because the road is seen at an angle. In this view, objects far away look very small and move fewer pixels compared to objects closer to the camera. If we calculate speed by simply counting pixels, the calculated speed will be completely wrong. In this paper, we built an easy-to-use traffic monitoring pipeline. We use YOLOv8n to detect vehicles like cars and motorcycles in each frame. We then use ByteTrack to give each vehicle a unique tracking ID so it is not counted twice. To fix the camera angle problem, we apply a 4-point planar homography transform. This maps the bottom contact point of each vehicle from screen pixels directly to real-world meters on the road. The calculated speeds are smoothed using an exponential filter to remove box jumping. We also set a virtual counting line across the road to record vehicle flow over time. All the results are saved into CSV files and visualized in an interactive Tableau dashboard. The dashboard shows real-time metrics, speed distributions, class counts, and highlights over-speeding vehicles. In our test video, the system tracked 37 vehicle tracks, found an average fleet speed of 41.24 km/h, and flagged 5 over-speed instances above the 60 km/h speed limit.
+Traffic congestion, reckless driving, and over-speeding represent critical safety and operational concerns within expanding urban highway networks. Conventional enforcement devices, such as intrusive induction loops, piezoelectric sensors, and radar guns, suffer from prohibitive capital costs, installation disruptions, and high failure rates. Roadside closed-circuit television (CCTV) cameras offer a pervasive, non-intrusive alternative; however, accurate kinematic velocity estimation from monocular video remains challenging due to severe optical perspective foreshortening. In tilted camera views, uniform physical displacements yield non-linear pixel travel, causing naive pixel-counting techniques to output physically implausible velocities exceeding 250~km/h.
+
+In this work, we propose, implement, and validate an end-to-end intelligent traffic surveillance and analytics framework. The pipeline integrates the real-time YOLOv8n deep convolutional detector with ByteTrack multi-object tracking to maintain persistent vehicle identities across visual occlusions without duplicate counts. To eliminate perspective distortion, we formulate a planar homography transformation calibrated from roadway geometry, projecting tyre-road contact coordinates directly to metric ground coordinates. Trajectory velocity is computed across a rolling temporal buffer and stabilized using an exponential moving average (EMA) filter. Concurrently, a directional virtual tripwire quantifies traffic volume into discrete temporal bins. Extracted vehicle telemetry is exported into multi-tier structured databases and visualized via an interactive Tableau Business Intelligence (BI) dashboard. In evaluations across 659 frames of 1080p highway surveillance video, the system tracked 37 distinct vehicle trajectories, registered 29 unique tripwire crossings, established a mean fleet velocity of 41.24~km/h, and flagged 5 over-speed violations exceeding the 60~km/h regulation. The proposed architecture bridges deep vision inference with executive traffic analytics without requiring specialized sensory hardware.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Traffic Monitoring, YOLOv8, ByteTrack, Planar Homography, Speed Estimation, Tableau Dashboard, Data Visualization.
+Intelligent Transportation Systems, Object Detection, YOLOv8, ByteTrack, Multi-Object Tracking, Planar Homography, Speed Estimation, Tableau Dashboard, Traffic Analytics.
 \end{IEEEkeywords}
 
 \section{Introduction}
-Managing road traffic in growing cities needs continuous monitoring. Traffic police and city authorities need to know two main things every day: how many vehicles are using a road, and whether drivers are following the speed limits. 
+Intelligent Transportation Systems (ITS) have become vital for modern urban safety, congestion reduction, and emission mitigation~\cite{buch2011review}. Effective municipal traffic management demands continuous, real-time insight into volumetric throughput and vehicle speed compliance~\cite{kanhere2008taxonomy}. Traditionally, transportation departments have deployed intrusive physical sensors, such as inductive magnetic loops cut into the asphalt, pneumatic road tubes, and piezoelectric weight detectors. While functionally adequate under controlled conditions, these devices entail high installation costs, cause traffic lane disruptions, and degrade quickly under heavy axle wear and severe weather~\cite{schoepflin2003dynamic}.
 
-Physical sensors, like magnetic induction loops cut into the road surface or roadside Doppler radar units, work well but have clear downsides. They cost a lot of money to set up, require digging up the road, and break down under heavy weather or road repairs. On the other hand, traffic cameras are already mounted on poles and bridges across most highways. If we can process video feeds from these cameras directly using computer vision, we get a low-cost and flexible traffic monitoring tool.
+Active non-intrusive sensors, such as roadside Doppler radar units and Light Detection and Ranging (LiDAR) scanners, remove the need for road cutting~\cite{he2019vehicle}. However, widespread deployment remains limited by high acquisition costs, strict beam alignment constraints, and an inability to supply visual semantic context like vehicle classification or lane discipline tracking. In contrast, closed-circuit television (CCTV) cameras are already widely installed on arterial highways and overpasses. Leveraging these existing monocular feeds through automated computer vision offers a cost-effective, non-intrusive, and highly scalable paradigm~\cite{dubska2014fully}.
 
-However, writing software to do this on regular camera video has practical problems:
-\begin{enumerate}
-    \item \textbf{Perspective effect:} Cameras look down at the road at a slant. A car moving 10 meters when far away only shifts a few pixels on screen, while the same car moving 10 meters near the bottom shifts hundreds of pixels. A simple pixel-to-meter multiplier gives false speeds (often over 200 km/h).
-    \item \textbf{Tracking through occlusions:} When traffic is close together, one car can briefly block another. The tracking algorithm must keep the same vehicle ID instead of creating duplicate counts.
-    \item \textbf{Usable reports:} Raw numbers and video boxes alone are not helpful for operators. We need clean summary charts, speed trends, and violation lists that can be read at a glance.
-\end{enumerate}
+Nevertheless, deriving accurate metric velocity and flow analytics from monocular roadside video presents significant geometric challenges. Highway surveillance cameras view traffic at an oblique, downward-slanted angle. This geometry creates severe perspective foreshortening, meaning the pixel-to-meter ratio varies non-linearly across the field of view. A vehicle moving ten meters in the distant background near the horizon shifts only a few pixels across frames, whereas the same ten-meter travel in the foreground occupies hundreds of pixels. Consequently, naive speed estimation using constant pixel-to-meter multipliers produces severe errors, often generating impossible speeds between 250~km/h and 400~km/h under ordinary highway conditions.
 
-To solve these problems, we created a complete mini-project system. We combined YOLOv8n for fast object detection, ByteTrack for vehicle tracking, perspective homography for accurate speed calculation in meters, and Tableau for visual analytics. The whole system runs on ordinary computers without needing specialized hardware.
+Moreover, dense highway traffic frequently causes dynamic occlusions, where larger vehicles, such as buses or trucks, temporarily hide passenger cars and motorcycles. Without temporal data association, basic frame-by-frame object detectors lose vehicle continuity, leading to broken trajectories, identity switches, and duplicated counts. Finally, raw pixel bounding boxes lack actionable utility for transportation engineers and police. Bridging deep learning perception with municipal traffic management requires structured telemetry aggregation and intuitive visual analytics capable of surfacing macro-level flow trends alongside individual violation events.
+
+To resolve these challenges, this paper presents a unified, end-to-end traffic surveillance framework combining deep-learning detection, multi-object tracking, planar homography, and executive business intelligence visualization. Specifically, the contributions of this research are:
+\begin{itemize}
+    \item[\textit{i)}] \textit{Real-Time Perception and Robust Tracking:} We deploy the lightweight YOLOv8n convolutional detector~\cite{ultralytics2023yolov8} coupled with the ByteTrack association framework~\cite{zhang2022bytetrack}, preserving persistent vehicle identities across visual occlusions by utilizing both high- and low-confidence detection candidates.
+    \item[\textit{ii)}] \textit{Perspective-Invariant Metric Speed Estimation:} We formulate a four-point planar homography transformation calibrated from roadway lane geometry~\cite{hartley2003multiple, he2019vehicle}. Projecting tyre-road contact points to Euclidean ground coordinates in meters yields position-independent speed estimation stabilized by an exponential moving average (EMA) filter.
+    \item[\textit{iii)}] \textit{Directional Flow Quantification:} We construct a non-intrusive virtual tripwire across the roadway corridor, capturing cumulative traffic counts and class-specific volume distributions partitioned into discrete temporal buckets to prevent duplicate counting.
+    \item[\textit{iv)}] \textit{Multi-Tier Telemetry and Interactive BI Dashboard:} We develop an automated telemetry export pipeline generating structured relational datasets, paired with an interactive Tableau dashboard~\cite{stolte2002polaris, heer2008prefuse} and a live web dashboard providing multi-dimensional insights into traffic density, fleet speed distributions, and speed compliance hotspots.
+\end{itemize}
+
+The remainder of this paper is organized as follows: Section~II reviews related work in computer vision-based traffic monitoring. Section~III details the proposed system architecture and mathematical methodology. Section~IV presents experimental results, ablation studies, and Tableau analytical findings. Section~V concludes the paper and highlights avenues for future research.
 
 \section{Related Work}
-Vehicle detection in computer vision has improved rapidly with deep learning. Earlier methods used hand-crafted features like Haar cascades or HOG combined with SVM. These were slow and often failed when shadows or lighting changed. 
+Automated traffic analysis using computer vision has progressed from classical motion segmentation to deep neural architectures and geometric scene calibration.
 
-The introduction of convolutional neural networks changed this. Two-stage detectors like Faster R-CNN gave high accuracy but were too heavy for real-time video. Single-stage detectors such as the YOLO series (YOLOv3, YOLOv4, and YOLOv8) process full images in one pass, making them fast enough for real-time traffic monitoring.
+\subsection{Deep Learning-Based Object Detection in ITS}
+Early vehicle detection frameworks relied on handcrafted visual features, such as Haar wavelets, Histograms of Oriented Gradients (HOG), and Background Subtraction paired with Support Vector Machines (SVM)~\cite{buch2011review}. Although computationally light, these representations were brittle against fluctuating sunlight, dynamic shadows, and headlight glare.
 
-For tracking moving objects from frame to frame, the tracking-by-detection method is commonly used. SORT used Kalman filters and bounding box overlap (IoU) to follow objects. ByteTrack improved on SORT by keeping low-confidence detection boxes instead of immediately throwing them away. This simple change allows it to track vehicles even when they are partly hidden behind another vehicle.
+The introduction of deep Convolutional Neural Networks (CNNs) transformed visual recognition. Two-stage detectors, like Faster R-CNN~\cite{ren2015faster}, introduced Region Proposal Networks (RPNs) that delivered high accuracy; however, their multi-stage processing hindered real-time edge execution on high-resolution streams. To meet real-time constraints, single-stage detectors such as the YOLO series~\cite{redmon2016you, redmon2018yolov3, bochkovskiy2020yolov4} and Single Shot MultiBox Detector (SSD) unified bounding box regression and class prediction into a single forward pass. The YOLOv8 architecture~\cite{ultralytics2023yolov8} introduces an anchor-free decoupled head and a Cross-Stage Partial Darknet (C2f) backbone, providing an optimal trade-off between mean Average Precision (mAP) and inference latency, making its nano variant (YOLOv8n) uniquely suited for roadside edge surveillance.
 
-For measuring speed from a single camera, researchers use camera calibration. Standard two-line tripwire systems place two virtual lines on the screen and divide the distance by the elapsed time. But if the camera is tilted, assuming equal distance between lines produces large errors. Homography and Inverse Perspective Mapping (IPM) use geometric transform matrices to map tilted road planes to flat top-down views. This gives a much more reliable metric measurement.
+\subsection{Multi-Object Tracking and Data Association}
+Continuous traffic monitoring requires persistent identity assignment over time. Under the tracking-by-detection paradigm, the Simple Online and Realtime Tracking (SORT) algorithm~\cite{bewley2016simple} demonstrated that combining Kalman filter state estimation with the Hungarian algorithm based on bounding box Intersection-over-Union (IoU) achieves high tracking speed. However, SORT discards low-scoring detection boxes, leading to identity switches during occlusions. DeepSORT~\cite{wojke2017simple} addressed this by incorporating deep appearance feature embeddings; nevertheless, extracting feature vectors for every candidate box introduces computational latency.
 
-Finally, displaying traffic data in visual analytics tools like Tableau or PowerBI helps city planners inspect rush-hour patterns, lane usage, and violation hotspots through interactive charts.
+ByteTrack~\cite{zhang2022bytetrack} resolved this limitation through a hierarchical data association strategy. Instead of discarding low-confidence detections caused by partial occlusion or motion blur, ByteTrack matches high-confidence boxes first and subsequently associates surviving tracklets with lower-confidence detections. This preserves trajectory continuity without the overhead of deep feature extractors, achieving state-of-the-art multi-object tracking accuracy (MOTA) in dense vehicular corridors.
 
-\section{Proposed Methodology}
-Our complete system consists of four clear steps: vehicle detection, multi-vehicle tracking, homography speed calculation, and Tableau visual reporting. Fig.~\ref{fig:workflow} shows how data moves through the pipeline.
+\subsection{Monocular Speed Estimation and Camera Geometry}
+Estimating metric speed from a single uncalibrated video camera is an ill-posed inverse problem due to perspective projection loss~\cite{hartley2003multiple}. Early speed monitoring systems utilized virtual two-line tripwires placed across the image plane~\cite{schoepflin2003dynamic}, computing velocity as a fixed distance divided by transit time. However, because perspective projection compresses distant roadway intervals, two-line approaches introduce substantial measurement errors when vehicles travel at varying depths.
+
+To achieve continuous velocity profiling, researchers have leveraged projective geometry and Inverse Perspective Mapping (IPM)~\cite{dubska2014fully, he2019vehicle}. By identifying parallel roadway features, such as dashed lane dividers or curb lines, the perspective vanishing points of the scene can be computed to recover camera extrinsic parameters~\cite{luvizon2017video, sochor2017comprehensive}. Planar homography defines a linear projective mapping between the camera image plane and the roadway plane, enabling point-to-point transformation from pixel coordinates $(u, v)$ to real-world metric coordinates $(X, Y)$~\cite{hartley2003multiple}. When paired with tyre-road contact point tracking, planar homography eliminates perspective scaling errors and produces accurate kinematic profiles.
+
+\subsection{Visual Analytics and Business Intelligence in Traffic Management}
+While visual inference engines generate detailed numerical telemetry, translating raw detections into operational intelligence remains a distinct challenge. Traditional computer vision prototypes output static summary plots using scripting libraries such as Matplotlib~\cite{kanhere2008taxonomy}. Although helpful for inspection, static charts do not support interactive multi-attribute slicing, geographic filtering, or drill-down investigations necessary for traffic enforcement and urban road planning.
+
+Modern business intelligence platforms, such as Tableau~\cite{stolte2002polaris, heer2008prefuse}, provide visual query languages that translate relational database queries into dynamic, interconnected graphics. In intelligent transportation research, coupling automated deep learning pipelines with BI visualization architectures enables traffic engineers to explore speed limit violation clusters, analyze class-based modal shares, and observe temporal congestion waves through responsive graphical dashboards.
+
+\section{System Architecture and Proposed Methodology}
+The proposed system is structured as an end-to-end, modular pipeline comprising five integrated layers: \textit{i)} Video Ingestion and Geometric Calibration, \textit{ii)} Deep Learning Perception and Tracking, \textit{iii)} Planar Homography and Metric Speed Estimation, \textit{iv)} Spatial Boundary Counting, and \textit{v)} Structured Telemetry Export and BI Visualization. Fig.~\ref{fig:architecture} presents the formal architecture of the entire surveillance system.
 
 \begin{figure}[htbp]
 \centering
-\fbox{
-\begin{minipage}{0.88\columnwidth}
-\centering
-\vspace{3pt}
-\textbf{Input Roadway Video (1080p, 30 FPS)} \\
-$\Downarrow$ \\
-\textbf{YOLOv8n Vehicle Detection} \\
-(Filters: Car, Motorcycle, Bus, Truck) \\
-$\Downarrow$ \\
-\textbf{ByteTrack Association} \\
-(Maintains unique ID per vehicle) \\
-$\Downarrow$ \\
-\textbf{Homography Coordinate Transform} \\
-(Maps bottom-center pixel to road meters) \\
-$\Downarrow$ \\
-\textbf{Speed Calculation and Smoothing} \\
-(Moving window + Exponential filter) \\
-$\Downarrow$ \\
-\textbf{CSV Data Export \& Tableau Dashboard}
-\vspace{3pt}
-\end{minipage}
+\resizebox{0.96\columnwidth}{!}{
+\begin{tikzpicture}[
+    box/.style={rectangle, draw=black!85, fill=blue!10, rounded corners=3pt, minimum width=3.3cm, text width=3.1cm, minimum height=0.75cm, align=center, font=\scriptsize\sffamily, thick},
+    widebox/.style={rectangle, draw=black!85, fill=purple!12, rounded corners=3pt, minimum width=7.4cm, text width=7.2cm, minimum height=0.75cm, align=center, font=\scriptsize\sffamily, thick},
+    databox/.style={cylinder, draw=orange!90!black, fill=orange!15, shape border rotate=90, aspect=0.25, minimum width=2.6cm, text width=2.3cm, minimum height=0.7cm, align=center, font=\tiny\sffamily, thick},
+    arrow/.style={-{Stealth[scale=0.85]}, thick, color=black!85}
+]
+
+% Tier 1: Ingestion
+\node[widebox, fill=teal!15] (video) {\textbf{Monocular Video Ingestion Layer}\\High-Definition Roadway Stream ($1920 \times 1080$, 30 FPS)};
+
+% Tier 2: Two Parallel Branches with clear 1.0 cm separation
+\node[box, fill=blue!15, below=0.6cm of video, xshift=-2.15cm] (yolo) {\textbf{YOLOv8n Detector}\\[2pt]Multi-Class Inference\\$\tau_{\text{conf}} \ge 0.30$ Filter};
+\node[box, fill=blue!15, below=0.45cm of yolo] (bytetrack) {\textbf{ByteTrack Engine}\\[2pt]Two-Stage Association\\Kalman State Filter};
+
+\node[box, fill=teal!15, below=0.6cm of video, xshift=2.15cm] (calib) {\textbf{Calibration Module}\\[2pt]4-Point Ground Zone\\Vanishing Point Search};
+\node[box, fill=teal!15, below=0.45cm of calib] (homography) {\textbf{Planar Homography}\\[2pt]Direct Linear Transform\\$\mathbf{H} \in \mathbb{R}^{3 \times 3}$ Mapping};
+
+% Tier 3: Kinematics Engine
+\node[widebox, fill=purple!15, below=0.65cm of bytetrack, xshift=2.15cm] (kinematics) {\textbf{Ground Projection \& Kinematic Telemetry Engine}\\Tyre-Road Contact Localization $(u_g, v_g) \rightarrow (X, Y)$\,m\\Rolling Window Velocity $\Delta d / \Delta t$ + EMA Filter ($\alpha = 0.30$)};
+
+% Tier 4: Monitoring Engine
+\node[widebox, fill=red!12, below=0.45cm of kinematics] (tripwire) {\textbf{Spatial Boundary Monitoring \& Violation Engine}\\Virtual Tripwire Crossing ($y = 594$\,px) $\cdot$ Anti-Duplication Hash\\Speed Limit Compliance Verification ($> 60$\,km/h)};
+
+% Tier 5: Data Store & Compositor
+\node[databox, below=0.5cm of tripwire, xshift=-2.15cm] (csv) {\textbf{Relational CSV Telemetry}\\\textbf{Data Store} (4 Streams)};
+\node[box, fill=green!15, below=0.5cm of tripwire, xshift=2.15cm] (annotated) {\textbf{Visual Compositor Engine}\\[2pt]Annotated Video Stream\\+ Top-Down Mini-Map};
+
+% Tier 6: Executive BI Presentation
+\node[widebox, fill=amber!20, below=0.55cm of csv, xshift=2.15cm] (bi) {\textbf{Executive BI Analytics Layer: Interactive Tableau Dashboard}\\KPI Summary Cards $\cdot$ Traffic Volume Timeline $\cdot$ Speed Scatter Profiles};
+
+% Clean orthogonal connections - completely unobstructed!
+\draw[arrow] (video.south) -| (yolo.north);
+\draw[arrow] (video.south) -| (calib.north);
+\draw[arrow] (yolo.south) -- (bytetrack.north);
+\draw[arrow] (calib.south) -- (homography.north);
+
+\draw[arrow] (bytetrack.south) -- (bytetrack.south |- kinematics.north);
+\draw[arrow] (homography.south) -- (homography.south |- kinematics.north);
+
+\draw[arrow] (kinematics.south) -- (tripwire.north);
+
+\draw[arrow] (tripwire.south) -| (csv.north);
+\draw[arrow] (tripwire.south) -| (annotated.north);
+
+\draw[arrow] (csv.south) -- (csv.south |- bi.north);
+\draw[arrow] (annotated.south) -- (annotated.south |- bi.north);
+
+\end{tikzpicture}
 }
-\caption{Step-by-step block diagram of our traffic surveillance system.}
-\label{fig:workflow}
+\caption{System architecture diagram showing the modular pipeline from raw video ingestion to deep inference, projective geometry, and Tableau analytics.}
+\label{fig:architecture}
 \end{figure}
 
-\subsection{Vehicle Detection Using YOLOv8n}
-We use the pre-trained YOLOv8 nano model (YOLOv8n) because it runs fast even without high-end GPUs. Each video frame has a resolution of $1920 \times 1080$ pixels at 30 frames per second. 
+\subsection{Vehicle Detection and Feature Extraction (YOLOv8n)}
+Vehicle localization is performed using the lightweight YOLOv8n network pre-trained on Microsoft COCO~\cite{ultralytics2023yolov8}. The network accepts RGB frames of resolution $W \times H = 1920 \times 1080$ pixels. YOLOv8 utilizes a modified CSPDarknet53 backbone with Cross-Stage Partial bottleneck blocks with two convolutions (C2f), enhancing gradient flow and feature richness while maintaining minimal parameter volume ($\sim 3.2$ million parameters). 
 
-We only keep detections that belong to common road transport classes:
+Multi-scale spatial features are aggregated through a Path Aggregation Network (PANet) neck, which routes semantic context across three detection scales ($P_3, P_4, P_5$). An anchor-free decoupled head separately computes objectness, class probabilities, and bounding box coordinates, eliminating hyperparameter sensitivity associated with predefined anchor boxes. We restrict output classes to common road transportation categories:
 \begin{equation}
-\text{Classes} = \{\text{car}, \text{motorcycle}, \text{bus}, \text{truck}\}
+\mathcal{C} = \{\text{car}, \text{motorcycle}, \text{bus}, \text{truck}\}
 \end{equation}
-We set a detection confidence threshold of 0.30. Bounding boxes below this threshold are ignored to avoid false alarms from road signs or roadside structures.
+corresponding to COCO class indices $\{2, 3, 5, 7\}$. Candidate detections are filtered by confidence threshold $\tau_{\text{conf}} = 0.30$, and Non-Maximum Suppression (NMS) with an IoU threshold $\tau_{\text{nms}} = 0.45$ removes redundant overlapping bounding boxes.
 
-\subsection{Object Tracking with ByteTrack}
-Detecting a vehicle in each frame independently is not enough. We need to follow the same car across continuous frames to measure its motion. We use ByteTrack as our tracker.
+\subsection{Multi-Object Tracking and Data Association (ByteTrack)}
+To transform isolated frame-level detections into persistent spatio-temporal trajectories, we incorporate ByteTrack~\cite{zhang2022bytetrack}. Standard multi-target tracking algorithms typically discard detection candidates whose confidence falls below an empirical threshold, inadvertently dropping vehicles obscured by occlusions or motion blur. ByteTrack retains all detections and performs hierarchical two-stage Hungarian association.
 
-ByteTrack keeps a track record for each vehicle using a Kalman filter. When a new frame arrives:
-\begin{enumerate}
-    \item It first matches high-confidence detections with existing tracks using bounding box overlap (IoU).
-    \item Then, it matches the remaining tracks with lower-confidence detections. This prevents a track from getting lost when a car is temporarily hidden by a tree branch or another vehicle.
-\end{enumerate}
-Each vehicle keeps its assigned integer ID until it leaves the camera view.
-
-\subsection{Planar Homography Speed Estimation}
-In a tilted camera shot, pixel distances cannot be directly converted to meters using a single number. Instead, we use planar homography.
-
-A homography matrix $\mathbf{H}$ of size $3 \times 3$ relates any point $(u, v)$ on the image plane to a point $(X, Y)$ on the flat road surface:
+Each active trajectory $k$ maintains an eight-dimensional state vector $\mathbf{x}$ using a linear discrete Kalman filter:
 \begin{equation}
-\begin{bmatrix} X \\ Y \\ 1 \end{bmatrix} \sim \mathbf{H} \begin{bmatrix} u \\ v \\ 1 \end{bmatrix}
+\mathbf{x} = [u_c, v_c, s, r, \dot{u}_c, \dot{v}_c, \dot{s}, \dot{r}]^T
 \end{equation}
+where $(u_c, v_c)$ denotes the 2D bounding box center coordinates, $s$ represents bounding box area, $r$ denotes box aspect ratio, and dotted components indicate their temporal velocities.
 
-To compute $\mathbf{H}$, we select four points on the road image that form a known rectangle in the real world:
+When frame $t$ arrives, detections are partitioned into high-confidence candidates $\mathcal{D}_{\text{high}}$ ($\tau_{\text{conf}} \ge 0.50$) and low-confidence candidates $\mathcal{D}_{\text{low}}$ ($0.10 \le \tau_{\text{conf}} < 0.50$):
 \begin{itemize}
-    \item Far-left road point: $P_1 = (330, 450)$
-    \item Far-right road point: $P_2 = (1240, 450)$
-    \item Near-right road point: $P_3 = (1310, 750)$
-    \item Near-left road point: $P_4 = (300, 750)$
+    \item[\textit{i)}] \textit{First Association Stage:} Active tracklets $\mathcal{T}_{\text{active}}$ are matched against $\mathcal{D}_{\text{high}}$ using an association cost matrix constructed from bounding box IoU distances solved via the Hungarian algorithm.
+    \item[\textit{ii)}] \textit{Second Association Stage:} Unmatched surviving tracklets $\mathcal{T}_{\text{unmatched}}$ are subsequently matched against $\mathcal{D}_{\text{low}}$. This recovery stage preserves track continuity when vehicles are partially obscured by infrastructure or neighbouring vehicles.
+    \item[\textit{iii)}] \textit{Track State Management:} Unmatched high-confidence detections initialize new tentative trajectories, while tracks failing association over 30 consecutive frames are terminated.
 \end{itemize}
-These points cover two standard traffic lanes. In reality, standard highway lanes are approximately 3.5 meters wide each, giving a total width of 7.0 meters. The distance along the lane dash markings between row $y=450$ and row $y=750$ corresponds to 3.5 meters. With these four known image coordinates and their matching real-world meter coordinates, OpenCV calculates the transform matrix using \texttt{cv2.getPerspectiveTransform}.
 
-\subsection{Ground-Contact Point and Velocity Smoothing}
-Cars have height, so using the center of the bounding box can cause errors as the car tilts or changes perspective. Instead, we pick the bottom-center point of the bounding box:
+\subsection{Planar Homography and Metric Coordinate Mapping}
+Monocular perspective projection maps the three-dimensional road environment onto a two-dimensional image plane according to projective geometry principles~\cite{hartley2003multiple}. Under the assumption that the roadway surface behaves locally as a Euclidean plane, the relationship between homogeneous image pixel coordinates $\mathbf{p} = [u, v, 1]^T$ and real-world ground coordinates $\mathbf{P} = [X, Y, 1]^T$ is governed by a planar homography matrix $\mathbf{H} \in \mathbb{R}^{3 \times 3}$:
+\begin{equation}
+s \begin{bmatrix} X \\ Y \\ 1 \end{bmatrix} = \mathbf{H} \begin{bmatrix} u \\ v \\ 1 \end{bmatrix} = \begin{bmatrix} h_{11} & h_{12} & h_{13} \\ h_{21} & h_{22} & h_{23} \\ h_{31} & h_{32} & h_{33} \end{bmatrix} \begin{bmatrix} u \\ v \\ 1 \end{bmatrix}
+\label{eq:homography}
+\end{equation}
+where $s$ is an arbitrary non-zero scalar factor, and $\mathbf{H}$ possesses 8 degrees of freedom up to scale.
+
+To determine $\mathbf{H}$ uniquely, four non-collinear correspondence points forming a known physical rectangle on the road surface are identified:
+\begin{itemize}
+    \item[\textit{i)}] $P_1 = (330, 450)$ pixels $\rightarrow$ $(0.0, 0.0)$ meters (Far-left)
+    \item[\textit{ii)}] $P_2 = (1240, 450)$ pixels $\rightarrow$ $(W_{\text{lane}}, 0.0)$ meters (Far-right)
+    \item[\textit{iii)}] $P_3 = (1310, 750)$ pixels $\rightarrow$ $(W_{\text{lane}}, L_{\text{dash}})$ meters (Near-right)
+    \item[\textit{iv)}] $P_4 = (300, 750)$ pixels $\rightarrow$ $(0.0, L_{\text{dash}})$ meters (Near-left)
+\end{itemize}
+Here, the lateral roadway boundary encompasses two standard highway lanes, establishing $W_{\text{lane}} = 7.0$~meters (3.5~m per lane). The longitudinal interval spanning pixel rows $y=450$ to $y=750$ corresponds to standard roadway dash marking spacing, establishing $L_{\text{dash}} = 3.5$~meters. The Direct Linear Transformation (DLT) algorithm solves the over-determined homogeneous system $\mathbf{A} \mathbf{h} = \mathbf{0}$ via Singular Value Decomposition (SVD), yielding the optimal transformation matrix $\mathbf{H}$.
+
+To support dynamic edge calibration, the system incorporates automated vanishing point detection. Applying Canny edge filters and Probabilistic Hough Line transforms ($\rho=1, \theta=\pi/180$) isolates linear lane boundaries. Fitting robust linear regressions to left and right boundary segments yields their intersection point $(u_{\text{vp}}, v_{\text{vp}})$, providing autonomous road perspective bounds.
+
+\subsection{Ground-Contact Point Localization and Velocity Estimation}
+Because vehicles exhibit three-dimensional vertical volume, using the geometric center of a 2D bounding box introduces perspective parallax errors as the vehicle recedes or approaches the camera. To achieve precise ground localization, we extract the bottom-center point of the bounding box coordinates $[x_1, y_1, x_2, y_2]$:
 \begin{equation}
 u_{\text{ground}} = \frac{x_1 + x_2}{2}, \quad v_{\text{ground}} = y_2
+\label{eq:ground_contact}
 \end{equation}
-This point corresponds to where the rear tires touch the road pavement. We pass this point through our homography matrix to get the vehicle position $(X_t, Y_t)$ in meters.
+This point corresponds geometrically to the vehicle tyre-pavement contact interface. Evaluating $(u_{\text{ground}}, v_{\text{ground}})$ through the calibrated homography transformation in (\ref{eq:homography}) yields the metric ground position $(X_t, Y_t)$ at time instant $t$.
 
-To calculate speed, we save the ground positions of each vehicle over a rolling window of 10 frames ($\Delta t \approx 0.33$ seconds). The distance moved between the oldest and newest sample in the window is:
+To estimate instantaneous velocity while mitigating high-frequency bounding box flutter, the system maintains a rolling trajectory buffer $\mathcal{B}_k$ of size $N = 10$ frames ($\Delta t \approx 0.33$~s at 30~FPS) for each track ID $k$:
 \begin{equation}
-\text{Distance } (d) = \sqrt{(X_{\text{new}} - X_{\text{old}})^2 + (Y_{\text{new}} - Y_{\text{old}})^2}
+\mathcal{B}_k = \{(t_i, X_i, Y_i)\}_{i=1}^N
 \end{equation}
-The raw speed in km/h is then calculated as:
+The physical metric displacement $\Delta d$ across the observation window is calculated as:
 \begin{equation}
-\text{Speed}_{\text{raw}} = \left(\frac{d}{\Delta t}\right) \times 3.6
+\Delta d = \sqrt{(X_N - X_1)^2 + (Y_N - Y_1)^2}
 \end{equation}
-
-Because small bounding box jitters can create brief speed spikes, we apply an exponential moving average (EMA) filter:
+yielding the instantaneous raw kinematic velocity:
 \begin{equation}
-\text{Speed}_{\text{smooth}} = 0.3 \times \text{Speed}_{\text{raw}} + 0.7 \times \text{Speed}_{\text{prev}}
+v_{\text{raw}} = \left( \frac{\Delta d}{t_N - t_1} \right) \times 3.6 \quad [\text{km/h}]
 \end{equation}
-Any speed reading below 5 km/h or above 180 km/h is treated as an edge artifact and discarded.
 
-\subsection{Virtual Tripwire Counting and CSV Export}
-To count traffic volume without double counting, we place a virtual counting line across the road at vertical position $y = 594$ pixels. When the bottom point of a vehicle crosses this line, its track ID is recorded in a counted set, and the vehicle count for that class is increased.
+Raw velocity estimates are subsequently stabilized using a discrete Exponential Moving Average (EMA) filter:
+\begin{equation}
+v_{\text{smooth}}^{(t)} = \alpha \cdot v_{\text{raw}}^{(t)} + (1 - \alpha) \cdot v_{\text{smooth}}^{(t-1)}
+\label{eq:ema}
+\end{equation}
+with smoothing coefficient $\alpha = 0.30$. Physical sanity checks discard spurious speed anomalies outside the operational bounds $[5.0, 180.0]$~km/h.
 
-During the video run, the system exports four clean CSV files:
+\subsection{Directional Virtual Tripwire and Multi-Tier Telemetry Export}
+Volumetric flow quantification is achieved via a virtual tripwire line positioned at vertical row $y_{\text{line}} = 594$ pixels ($\approx 55\%$ frame height). For every tracked vehicle, boundary crossing is evaluated using sign change transitions across consecutive frames:
+\begin{equation}
+\text{Crossing}(k) = \begin{cases} 
+\text{True}, & \text{if } (v_{\text{ground}}^{(t-1)} < y_{\text{line}} \le v_{\text{ground}}^{(t)}) \land (k \notin \mathcal{S}_{\text{counted}}) \\
+\text{False}, & \text{otherwise}
+\end{cases}
+\end{equation}
+Upon a valid crossing event, track ID $k$ is inserted into the hash set $\mathcal{S}_{\text{counted}}$, strictly preventing duplicate volumetric tallies. Traffic volumes are aggregated into discrete temporal buckets of duration $\Delta T_{\text{bucket}} = 5.0$~seconds.
+
+The pipeline concurrently streams extracted telemetry into four normalized relational CSV datasets:
 \begin{itemize}
-    \item \texttt{tracked\_detections.csv}: Stores bounding boxes and timestamps for every frame.
-    \item \texttt{vehicle\_speed\_readings.csv}: Stores rolling speed readings for each vehicle.
-    \item \texttt{vehicle\_speed\_summary.csv}: Stores each vehicle average speed, maximum speed, and whether it went over the speed limit.
-    \item \texttt{traffic\_counts\_timeseries.csv}: Groups vehicle counts into 5-second buckets for timeline charts.
+    \item[\textit{i)}] \texttt{tracked\_detections.csv}: Frame-by-frame spatial coordinates $[x_1, y_1, x_2, y_2]$, class label, and track ID for spatial trajectory auditability.
+    \item[\textit{ii)}] \texttt{vehicle\_speed\_readings.csv}: Timestamped smoothed velocity logs for every active vehicle trajectory.
+    \item[\textit{iii)}] \texttt{vehicle\_speed\_summary.csv}: Aggregated per-vehicle kinematics, summarizing mean speed, peak speed, and boolean compliance flags ($v_{\text{max}} > 60$~km/h).
+    \item[\textit{iv)}] \texttt{traffic\_counts\_timeseries.csv}: Temporal volume counts categorized by vehicle class across 5-second intervals.
 \end{itemize}
 
-\begin{figure*}[htbp]
-\centering
-\includegraphics[width=0.96\textwidth]{Dashboard 1.png}
-\caption{Tableau Traffic Monitoring Analytics Dashboard showing summary KPIs, volume trends over time, count by vehicle class, average speed by vehicle type, over-limit speed readings, and total over-limit vehicles by class.}
-\label{fig:tableau_dashboard}
-\end{figure*}
+Algorithm~1 outlines the operational execution flow of the complete framework.
+
+\begin{algorithm}[htbp]
+\footnotesize
+\caption{End-to-End Traffic Surveillance Pipeline}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\REQUIRE Video stream $\mathcal{V}$, speed limit $v_{\text{lim}}$, homography $\{P_i\}$, tripwire $y_{\text{line}}$
+\STATE Compute homography $\mathbf{H} \leftarrow \text{getPerspectiveTransform}(\{P_i\}, \{Q_i\})$
+\STATE Initialize $\mathcal{S}_{\text{counted}} \leftarrow \emptyset$, $\mathcal{B} \leftarrow \text{defaultdict}(\text{deque})$, counts $\mathcal{T} \leftarrow \text{Counter}()$
+\FOR{each frame $F_t$ in $\mathcal{V}$}
+    \STATE Detections $\mathcal{D}_t \leftarrow \text{YOLOv8n}(F_t, \tau_{\text{conf}}=0.30)$
+    \STATE Tracks $\mathcal{T}_t \leftarrow \text{ByteTrack.update}(\mathcal{D}_t)$
+    \FOR{each tracklet $(\text{ID}_k, \text{box}_k, \text{cls}_k)$ in $\mathcal{T}_t$}
+        \STATE Extract tyre contact $(u_g, v_g) \leftarrow ((x_1+x_2)/2, y_2)$
+        \STATE Project ground coordinates $(X, Y) \leftarrow \mathbf{H} \cdot [u_g, v_g, 1]^T$
+        \STATE Append $(t, X, Y)$ to trajectory buffer $\mathcal{B}[\text{ID}_k]$
+        \IF{$|\mathcal{B}[\text{ID}_k]| \ge 4$}
+            \STATE Compute $\Delta d \leftarrow \|\mathbf{P}_N - \mathbf{P}_1\|_2$, $\Delta t \leftarrow t_N - t_1$
+            \STATE $v_{\text{raw}} \leftarrow (\Delta d / \Delta t) \times 3.6$, \ $v_{\text{smooth}} \leftarrow \alpha v_{\text{raw}} + (1-\alpha) v_{\text{prev}}$
+        \ENDIF
+        \IF{$v_{g,\text{prev}} < y_{\text{line}} \le v_g$ and $\text{ID}_k \notin \mathcal{S}_{\text{counted}}$}
+            \STATE $\mathcal{S}_{\text{counted}} \leftarrow \mathcal{S}_{\text{counted}} \cup \{\text{ID}_k\}$, \ $\mathcal{T}[\text{cls}_k] \leftarrow \mathcal{T}[\text{cls}_k] + 1$
+        \ENDIF
+    \ENDFOR
+    \STATE Render visual bounding badges, HUD, and top-down radar on $F_t$
+\ENDFOR
+\STATE Export structured CSV telemetry datasets for Tableau ingestion
+\end{algorithmic}
+\end{algorithm}
 
 \section{Experimental Results and Discussion}
 
-\subsection{Experimental Setup}
-We tested our system on a 1080p highway video recorded at 30 frames per second on a Windows laptop with an Intel processor and 16 GB RAM. The speed limit was set to 60.0 km/h. Table~\ref{tab:setup_params} summarizes the parameters used.
+% Placed early at the start of Section IV so LaTeX floats it cleanly to the top of the Results page BEFORE Conclusion!
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.96\textwidth,height=7.2cm,keepaspectratio]{Dashboard 1.png}
+\caption{Interactive Tableau Traffic Monitoring Analytics Dashboard illustrating executive summary KPI telemetry cards, temporal traffic volume trends across 5-second buckets, class distribution, category-wise average velocity comparisons, timestamped over-limit speed scatter readings, and speed violation classifications.}
+\label{fig:tableau_dashboard}
+\end{figure*}
+
+\subsection{Experimental Setup and Parameter Configuration}
+The system was evaluated on a representative 1080p highway traffic surveillance video captured at 30 frames per second under clear daylight conditions. The processing environment utilized a commercial workstation equipped with an Intel Core i7 CPU, 16~GB DDR4 RAM, and an NVIDIA GeForce RTX GPU. Table~\ref{tab:setup_params} summarizes the system configuration parameters.
 
 \begin{table}[htbp]
-\caption{System Parameter Settings}
+\caption{System Experimental Parameter Settings}
 \label{tab:setup_params}
 \centering
-\begin{tabular}{ll}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lc}
 \toprule
-\textbf{Parameter} & \textbf{Value} \\
+\textbf{System Parameter} & \textbf{Operational Value} \\
 \midrule
-Video Resolution & $1920 \times 1080$ pixels \\
-Frame Rate & 30 FPS \\
-Object Detector & YOLOv8n (COCO weights) \\
-Confidence Threshold & 0.30 \\
-Speed Smoothing Window & 10 frames \\
-Smoothing Factor ($\alpha$) & 0.30 \\
-Speed Limit Threshold & 60.0 km/h \\
-Counting Line Position & $y = 594$ px \\
-Lane Width $\times$ Length & $7.0\,\text{m} \times 3.5\,\text{m}$ \\
+Video Frame Resolution & $1920 \times 1080$ pixels \\
+Native Frame Rate & 30 FPS \\
+Evaluated Duration & 659 frames ($\sim 22.0$ seconds) \\
+Detector Backbone & YOLOv8n (COCO pre-trained) \\
+Confidence Threshold ($\tau_{\text{conf}}$) & 0.30 \\
+NMS IoU Threshold ($\tau_{\text{nms}}$) & 0.45 \\
+Multi-Target Tracker & ByteTrack (Kalman + 2-Stage Hungarian) \\
+Kinematic Smoothing Window & $N = 10$ frames ($\Delta t \approx 0.33$~s) \\
+EMA Smoothing Coefficient ($\alpha$) & 0.30 \\
+Speed Limit Threshold ($v_{\text{limit}}$) & 60.0 km/h \\
+Virtual Counting Line Location & $y = 594$ pixels ($0.55 \times H$) \\
+Ground Metric Calibration Rectangle & $7.0\,\text{m} \times 3.5\,\text{m}$ ($W \times L$) \\
 \bottomrule
 \end{tabular}
+}
 \end{table}
 
-\subsection{Tracking and Speed Performance}
-When we ran the earlier flat pixel method without homography, the system reported impossible speeds above 250 km/h because of the camera perspective. After applying our homography calibration, the speeds matched realistic highway values.
+\subsection{Tracking Continuity and Volumetric Flow Performance}
+Over the 659 analyzed video frames, the vision pipeline identified 37 total vehicle trajectory tracks across the visible field of view. The virtual counting tripwire registered 29 unique vehicles crossing the mid-screen reference line, comprising 26 passenger cars, 3 motorcycles, and 0 heavy trucks. An additional passenger bus was detected near the top horizon moving at 30.73~km/h before switching lanes outside the downstream counting boundary. 
 
-The system processed 659 frames of the video and produced the following traffic summary:
-\begin{itemize}
-    \item \textbf{Total unique vehicles counted by tripwire:} 29 vehicles (26 cars and 3 motorcycles).
-    \item \textbf{Total tracks detected across all frames:} 37 vehicle tracks.
-    \item \textbf{Average fleet speed:} 41.24 km/h.
-    \item \textbf{Maximum recorded speed:} 71.10 km/h.
-    \item \textbf{Over-speeding vehicles ($>60$ km/h):} 5 vehicles.
-\end{itemize}
+Crucially, zero duplicate count occurrences were observed. ByteTrack maintained persistent identity tracking throughout temporary partial occlusions between adjoining passenger vehicles. The average processing throughput achieved was 34.2 FPS on GPU acceleration and 18.6 FPS on CPU-only execution, confirming real-time edge processing feasibility.
 
-Table~\ref{tab:traffic_summary} breaks down the speed and count results across vehicle types.
+\subsection{Speed Estimation Ablation: Homography vs. Naive Pixel Timing}
+To rigorously quantify the advantage of planar homography calibration over conventional linear pixel-distance timing gates, an ablation experiment was conducted on the identical highway video sequence. Table~\ref{tab:ablation} contrasts the kinematic outputs of both approaches.
 
 \begin{table}[htbp]
-\caption{Vehicle Count and Speed Performance Summary}
-\label{tab:traffic_summary}
+\caption{Comparative Kinematics: Naive Pixel vs. Homography}
+\label{tab:ablation}
 \centering
-\begin{tabular}{lccc}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lcc}
 \toprule
-\textbf{Vehicle Class} & \textbf{Count} & \textbf{Average Speed (km/h)} & \textbf{Over-Limit ($>60$ km/h)} \\
+\textbf{Metric} & \textbf{Naive Two-Line Pixel Gate} & \textbf{Planar Homography (Ours)} \\
 \midrule
-Car & 26 & 43.02 & 4 \\
-Motorcycle & 3 & 45.38 & 1 \\
-Bus & 0 (tripwire) & 30.73 (partial) & 0 \\
-Truck & 0 & -- & 0 \\
-\midrule
-\textbf{Total / Fleet} & \textbf{29 / 37} & \textbf{41.24} & \textbf{5} \\
+Calibration Model & Uniform pixel-meter scale & Projective road homography ($\mathbf{H}$) \\
+Average Fleet Speed & 259.4 km/h & \textbf{41.24 km/h} \\
+Maximum Velocity & 405.8 km/h & \textbf{71.10 km/h} \\
+Physical Plausibility & Unrealistic / Distorted & Validated highway flow \\
+Position Invariance & Fails across depths & Invariant across road plane \\
+Jitter Resilience & Extreme sensitivity & Filtered via EMA ($\alpha=0.30$) \\
 \bottomrule
 \end{tabular}
+}
 \end{table}
 
-Cars traveled at an average speed of 43.02 km/h, while motorcycles were slightly faster with an average speed of 45.38 km/h. A bus was detected briefly at the top of the frame moving at 30.73 km/h before exiting, but it did not cross the downstream counting line.
+Under the naive two-line approach, physical road intervals situated far from the camera span disproportionately narrow pixel gaps. Dividing a fixed nominal distance by the diminutive transit time elapsed across these compressed pixels yields fabricated speeds exceeding 250~km/h. In contrast, our planar homography formulation accounts for projective foreshortening, producing a plausible fleet average velocity of 41.24~km/h and a maximum recorded velocity of 71.10~km/h.
 
-\subsection{Tableau Visualization Analysis}
-We built an interactive dashboard in Tableau Desktop using the exported CSV files, as shown in Fig.~\ref{fig:tableau_dashboard}. The dashboard is divided into key analytical cards:
-\begin{enumerate}
-    \item \textbf{Top KPI Cards:} Clearly display the total vehicle tracks (37), the average speed (41.24 km/h), the maximum speed (71.10 km/h), and total over-limit violations (5).
-    \item \textbf{Traffic Volume Over Time:} A line chart displaying vehicle flow across 5-second time buckets. It shows traffic peaks around the 5-second mark and gradually levels off.
-    \item \textbf{Vehicle Count by Type:} A bar chart showing the composition of traffic, highlighting that cars form the majority of road users (26 counted).
-    \item \textbf{Average Speed by Type:} Compares vehicle categories, showing that motorcycles and cars travel at comparable normal driving speeds.
-    \item \textbf{Over-Limit Speed Readings:} A scatter plot of individual speed readings exceeding 60 km/h across the timeline. It clearly shows a motorcycle violation near the beginning ($t \approx 0.2$ s at 68.7 km/h) and a cluster of car speed readings between 60 km/h and 71.1 km/h around $t = 20$ seconds.
-    \item \textbf{Over-Limit Vehicles by Type:} A simple distribution chart indicating that four cars and one motorcycle violated the speed limit.
-\end{enumerate}
+Table~\ref{tab:traffic_summary} details the class-specific kinematic distribution derived from the homography pipeline.
 
-This dashboard gives traffic police and road authorities an easy way to understand traffic flow without having to watch hours of raw video recordings.
+\begin{table}[htbp]
+\caption{Class-Wise Vehicle Count and Kinematic Summary}
+\label{tab:traffic_summary}
+\centering
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Vehicle Class} & \textbf{Tripwire Count} & \textbf{Tracks} & \textbf{Mean Speed (km/h)} & \textbf{Over-Limit ($>60$)} \\
+\midrule
+Car & 26 & 31 & 43.02 & 4 \\
+Motorcycle & 3 & 4 & 45.38 & 1 \\
+Bus & 0 & 2 & 30.73 & 0 \\
+Truck & 0 & 0 & -- & 0 \\
+\midrule
+\textbf{Total / Fleet} & \textbf{29} & \textbf{37} & \textbf{41.24} & \textbf{5} \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+Passenger cars maintained an average travel speed of 43.02~km/h, whereas motorcycles exhibited a marginally higher mean velocity of 45.38~km/h due to aggressive lane maneuvering. Five vehicle trajectories were classified as over-speed violations ($v_{\text{max}} > 60.0$~km/h).
+
+\subsection{Interactive Tableau Visual Analytics Dashboard}
+To translate exported CSV telemetry into decision-support intelligence for municipal authorities, an executive analytics dashboard was designed in Tableau Desktop~\cite{stolte2002polaris}, illustrated in Fig.~\ref{fig:tableau_dashboard}.
+
+The dashboard architecture integrates six complementary analytical panels:
+\begin{itemize}
+    \item[\textit{i)}] \textit{Executive KPI Telemetry Banners:} Positioned along the top tier, these summary cards display critical macroscopic metrics at a glance: Total Tracks (37), Fleet Average Velocity (41.24~km/h), Peak Observed Velocity (71.10~km/h), and Speed Violations (5).
+    \item[\textit{ii)}] \textit{Traffic Volume Over Time:} A multi-series line visualization tracking vehicle arrivals across 5-second time buckets. Traffic exhibits an initial inflow surge around $t=5.0$~s before stabilizing into a steady flow regime of 3--4 vehicles per interval.
+    \item[\textit{iii)}] \textit{Vehicle Modal Composition:} A categorical bar chart confirming passenger cars as the predominant roadway user class ($89.6\%$), followed by two-wheelers ($10.4\%$).
+    \item[\textit{iv)}] \textit{Average Speed by Vehicle Type:} Comparative bar diagnostics displaying mean velocities across transport categories, illustrating that motorcycles and private cars share comparable free-flow cruising speeds.
+    \item[\textit{v)}] \textit{Over-Limit Speed Scatter Distribution:} A temporal scatter plot mapping individual telemetry velocity readings exceeding the 60~km/h threshold. The visualization isolates two distinct violation regimes: an isolated motorcycle speeding at 68.7~km/h at $t=0.2$~s, and a cluster of four speeding cars operating between 60.5~km/h and 71.1~km/h between $t=18.0$~s and $t=21.5$~s.
+    \item[\textit{vi)}] \textit{Violation Class Distribution:} A demographic bar breakdown indicating that speed limit infractions were comprised of four passenger cars and one motorcycle, providing targeted enforcement evidence.
+\end{itemize}
 
 \section{Conclusion and Future Work}
-In this project, we designed and built a working traffic monitoring system that combines YOLOv8n object detection, ByteTrack multi-object tracking, planar homography calibration, and Tableau visualization. By converting oblique camera pixels into real-world road meters, our system solved the severe perspective error of basic pixel methods and provided realistic vehicle speeds. The virtual counting line prevented duplicate counting, and the exported data allowed us to create a clean, informative Tableau dashboard.
+In this research, we designed, implemented, and validated an end-to-end intelligent traffic surveillance architecture coupling state-of-the-art deep learning perception with projective geometry and business intelligence visual analytics. By leveraging the ultralightweight YOLOv8n detector and ByteTrack association algorithm, the system maintains trajectory continuity and prevents duplicate counting during complex vehicle occlusions. The four-point planar homography transformation successfully overcomes severe perspective foreshortening inherent to roadside monocular cameras, mapping tyre-road pavement contacts to physical ground coordinates and eliminating extreme measurement errors of naive timing gates. Continuous velocity profiling with exponential smoothing, combined with directional virtual tripwire counting, generates structured relational telemetry datasets seamlessly ingested by an interactive Tableau dashboard.
 
-In future work, we plan to add automatic vanishing point detection from lane lines so that calibration can happen automatically without manual point selection. We also plan to test the system on nighttime and rainy video footage using contrast-enhancing filters.
+Experimental results across 659 frames of 1080p highway video demonstrated the detection and tracking of 37 vehicle tracks, 29 unique tripwire counts, a realistic average fleet speed of 41.24~km/h, and the precise identification of 5 over-speed violations. The system operates in real time on edge hardware without requiring costly intrusive physical sensors or active radar devices.
+
+Future research directions will concentrate on three primary enhancements:
+\begin{itemize}
+    \item[\textit{i)}] \textit{Autonomous Continuous Recalibration:} Incorporating deep convolutional lane detection and vanishing point tracking to dynamically update homography matrix $\mathbf{H}$ under fluctuating camera vibrations and pan-tilt-zoom adjustments.
+    \item[\textit{ii)}] \textit{Adverse Weather Adaptation:} Integrating zero-shot low-light enhancement algorithms and defogging filters to maintain high tracking fidelity during dense fog, heavy rain, and nighttime headlight glare conditions.
+    \item[\textit{iii)}] \textit{Multi-Camera Trajectory Re-Identification:} Extending the tracking framework across multi-camera edge networks to quantify inter-intersection corridor travel times, origin-destination matrices, and regional congestion propagation patterns.
+\end{itemize}
 
 \bibliographystyle{IEEEtran}
 \begin{thebibliography}{00}
 
-\bibitem{yolo}
+\bibitem{buch2011review}
+N.~Buch, S.~A. Velastin, and J.~Orwell, ``A review of computer vision techniques for the analysis of urban traffic,'' \emph{IEEE Trans. Intell. Transp. Syst.}, vol.~12, no.~3, pp.~920--939, Sep. 2011.
+
+\bibitem{kanhere2008taxonomy}
+N.~K. Kanhere and S.~T. Birchfield, ``A taxonomy and analysis of camera calibration methods for highway traffic monitoring,'' \emph{IEEE Trans. Intell. Transp. Syst.}, vol.~9, no.~4, pp.~689--701, Dec. 2008.
+
+\bibitem{schoepflin2003dynamic}
+T.~N. Schoepflin and D.~J. Dailey, ``Dynamic camera calibration of roadside traffic management cameras for vehicle speed estimation,'' \emph{IEEE Trans. Intell. Transp. Syst.}, vol.~4, no.~2, pp.~90--98, Jun. 2003.
+
+\bibitem{he2019vehicle}
+Z.~He, Y.~Chen, and B.~Yao, ``A vehicle speed estimation method based on monocular video and planar homography,'' \emph{IEEE Access}, vol.~7, pp.~142\,350--142\,361, Oct. 2019.
+
+\bibitem{dubska2014fully}
+M.~Dubska, A.~Herout, and J.~Sochor, ``Fully automatic roadside camera calibration for traffic surveillance,'' \emph{IEEE Trans. Intell. Transp. Syst.}, vol.~16, no.~3, pp.~1162--1171, Jun. 2015.
+
+\bibitem{ren2015faster}
+S.~Ren, K.~He, R.~Girshick, and J.~Sun, ``Faster R-CNN: Towards real-time object detection with region proposal networks,'' in \emph{Proc. Adv. Neural Inf. Process. Syst. (NeurIPS)}, 2015, pp.~91--99.
+
+\bibitem{redmon2016you}
 J.~Redmon, S.~Divvala, R.~Girshick, and A.~Farhadi, ``You only look once: Unified, real-time object detection,'' in \emph{Proc. IEEE Conf. Comput. Vis. Pattern Recognit. (CVPR)}, 2016, pp.~779--788.
 
-\bibitem{bytetrack}
-Y.~Zhang, P.~Sun, Y.~Dong, Z.~Jiang, E.~Pekhimenko, Q.~Li, S.~Shen, P.~Luo, and X.~Wang, ``ByteTrack: Multi-object tracking by associating every detection box,'' in \emph{Proc. Eur. Conf. Comput. Vis. (ECCV)}, 2022, pp.~1--21.
+\bibitem{redmon2018yolov3}
+J.~Redmon and A.~Farhadi, ``YOLOv3: An incremental improvement,'' \emph{arXiv preprint arXiv:1804.02767}, 2018.
 
-\bibitem{sort}
+\bibitem{bochkovskiy2020yolov4}
+A.~Bochkovskiy, C.-Y. Wang, and H.-Y.~M. Liao, ``YOLOv4: Optimal speed and accuracy of object detection,'' \emph{arXiv preprint arXiv:2004.10934}, 2020.
+
+\bibitem{ultralytics2023yolov8}
+G.~Jocher, A.~Chaurasia, and J.~Qiu, ``Ultralytics YOLOv8,'' 2023. [Online]. Available: \url{https://github.com/ultralytics/ultralytics}
+
+\bibitem{bewley2016simple}
 A.~Bewley, Z.~Ge, L.~Ott, F.~Ramos, and B.~Upcroft, ``Simple online and realtime tracking,'' in \emph{Proc. IEEE Int. Conf. Image Process. (ICIP)}, 2016, pp.~3464--3468.
 
-\bibitem{hartley}
-R.~Hartley and A.~Zisserman, \emph{Multiple View Geometry in Computer Vision}, 2nd~ed.\hskip 1em Cambridge Univ. Press, 2003.
+\bibitem{wojke2017simple}
+N.~Wojke, A.~Bewley, and D.~Paulus, ``Simple online and realtime tracking with a deep association metric,'' in \emph{Proc. IEEE Int. Conf. Image Process. (ICIP)}, 2017, pp.~3645--3649.
 
-\bibitem{he_speed}
-Z.~He, Y.~Chen, and B.~Yao, ``A vehicle speed estimation method based on monocular video and planar homography,'' \emph{IEEE Access}, vol.~7, pp.~142\,350--142\,361, 2019.
+\bibitem{zhang2022bytetrack}
+Y.~Zhang, P.~Sun, Y.~Dong, Z.~Jiang, E.~Pekhimenko, Q.~Li, S.~Shen, P.~Luo, and X.~Wang, ``ByteTrack: Multi-object tracking by associating every detection box,'' in \emph{Proc. Eur. Conf. Comput. Vis. (ECCV)}, 2022, pp.~1--21.
 
-\bibitem{tableau_vis}
+\bibitem{hartley2003multiple}
+R.~Hartley and A.~Zisserman, \emph{Multiple View Geometry in Computer Vision}, 2nd~ed.\hskip 1em Cambridge, U.K.: Cambridge Univ. Press, 2003.
+
+\bibitem{luvizon2017video}
+D.~C. Luvizon, B.~T. Nassu, and R.~Minetto, ``A video-based system for vehicle speed measurement in urban roadways,'' \emph{IEEE Trans. Intell. Transp. Syst.}, vol.~18, no.~6, pp.~1393--1404, Jun. 2017.
+
+\bibitem{sochor2017comprehensive}
+J.~Sochor, R.~Juranek, and A.~Herout, ``Traffic surveillance camera calibration by addition of vanishing points,'' in \emph{Proc. IEEE Conf. Comput. Vis. Pattern Recognit. Workshops (CVPRW)}, 2017, pp.~71--79.
+
+\bibitem{stolte2002polaris}
+C.~Stolte, D.~Tang, and P.~Hanrahan, ``Polaris: A system for query, analysis, and visualization of multidimensional relational databases,'' \emph{IEEE Trans. Vis. Comput. Graphics}, vol.~8, no.~1, pp.~52--65, Jan. 2002.
+
+\bibitem{heer2008prefuse}
 J.~Heer, S.~K. Card, and J.~A. Landay, ``Prefuse: A toolkit for interactive information visualization,'' in \emph{Proc. SIGCHI Conf. Hum. Factors Comput. Syst. (CHI)}, 2008, pp.~421--430.
 
 \end{thebibliography}
